@@ -1,0 +1,233 @@
+---
+title: "Project 1 Happyness Moment"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, cache = TRUE, tidy = TRUE)
+```
+
+
+HappyDB is a corpus of 100,000 crowd-sourced happy moments via Amazon's Mechanical Turk. You can read more about it on https://arxiv.org/abs/1801.07746. Here we will dig deeper about the words of Happy Moment Sentences and visualize some detail aspects related with happiness.
+
+In this bolg, we will first overview what the happy moments are about and then zoom in the small group of people, parents. The main interest of this bolg is to find the sources of happy moments for parents. To dig deeper, we want to find the differences in happy topics for mathers and fathers.
+
+### Step 0 - Load the required R Packages
+```{r, cache=FALSE}
+packages.used=c("tidytext","tidyverse","DT", "scales","wordcloud2",
+"gplots","sentimentr","ngram","dplyr","qdap","ggplot2","topicmodels", "slam", "shiny")
+
+# check packages that need to be installed.
+packages.needed=setdiff(packages.used,
+                        intersect(installed.packages()[,1],   packages.used))
+# install additional packages
+if(length(packages.needed)>0){
+  install.packages(packages.needed, dependencies = TRUE)
+}
+
+library(tidyverse)
+library(tidytext)
+library(DT)
+library(scales)
+library(wordcloud2)
+library(gridExtra)
+library(ngram)
+library(shiny) 
+library(topicmodels)
+library(tm)
+library(ggplot2)
+library(dplyr)
+library(slam)
+```
+
+### Step 1 - Data Preparation and Overview
+
+We will use the data in `processed_moments.csv` that has already been stemmed and filtered out stop words. And we join the processedd text data with the demographic data, which will be futher analized in following steps.
+```{r load data}
+hm_data <- read_csv("../output/processed_moments.csv")
+demo_link <-'https://raw.githubusercontent.com/rit-public/HappyDB/master/happydb/data/demographic.csv'
+demo_data <- read_csv(demo_link)
+
+```
+
+
+```{r}
+hm_data <- hm_data %>%
+  inner_join(demo_data, by = "wid") %>%
+  select(wid,
+         original_hm,
+         num_sentence,
+         gender,
+         marital,
+         parenthood,
+         reflection_period,
+         age,
+         country,
+         ground_truth_category,
+         predicted_category,
+         text) %>%
+  mutate(count = sapply(hm_data$text, wordcount))
+```
+
+Here we can firstly overviw the top 200 frequent words about happy moments using word cloud. Overall, the top three frequentest words related happy moment are *friend*, *time*, *day*. It may reveal that we, social creatures, are more likely to experience happy moment staying, talking, palying, working et.al with our friends fro some day, some time in some place. 
+
+According to the `predicted_category` which classify happy moments into different types, the two main categories are *affection* and *achievement*. It means happiness mainly stem from spiritual satisfaction and self-fulfillment.
+
+```{r bag of words, warning=FALSE, message=FALSE}
+bag_of_words <-  hm_data %>%
+  unnest_tokens(word, text)
+
+word_count <- bag_of_words %>%
+  count(word, sort = TRUE)
+
+wordcloud2(data = word_count[1:200,])
+```
+
+```{r  predicted_cat}
+word_count_cat <- hm_data %>% count(predicted_category, sort = TRUE) 
+ggplot(data = word_count_cat, aes(x=reorder(predicted_category, n), y=n)) +
+  geom_bar(stat="identity", fill= "blue")  + xlab("predicted_category") + coord_flip()
+  
+```
+
+
+### Step 2 - Dose gender effects the happiness of parents ?
+
+As we konw, parents happy moments are often related with their children. Here we want to know if the gender effects the happiness of parents. The dual bar chart below shows that frequencies of top 10 words of each gender. As it shows, besides parents are happy with friends, family, mothers' happy moments mention slightly more times than fathers on `son`, `daughter`, `day`, `friend`, `family`. Howerver, mothers' would be delighted to care about education and fathers happy moments are more involved in palying moments, maybe with kids.
+Comparing the femal and male between parents and not parents, affection category happends more for mothers and achievment category happends more for fathers. 
+
+```{r  predicted_cat_gender}
+word_count_cat_gender <- hm_data  %>% 
+  filter(gender %in% c("f", "m") & parenthood %in% c("y", "n")) %>% 
+  group_by(gender, parenthood) %>% 
+  count(predicted_category, sort = TRUE) 
+ggplot(data = word_count_cat_gender, aes(x=reorder(predicted_category, n), y=n, color=gender, group=parenthood, fill=parenthood)) +
+  geom_bar(stat="identity", position ="dodge" )  + xlab("predicted_category") + coord_flip() + facet_wrap( ~ gender, scales="free")
+  
+```
+
+```{r gender in parenthood}
+word_count_gender_parenthood <- bag_of_words %>% 
+  filter(parenthood == "y" & !is.na(gender)) %>%
+  group_by(gender) %>%
+  count(word)  %>%
+  top_n(15, n) %>%
+  ungroup() %>%
+  arrange(desc(n))
+
+word_count_gender_parenthood[word_count_gender_parenthood$gender=="f", "n"] <- -word_count_gender_parenthood[word_count_gender_parenthood$gender=="f", "n"]
+
+ggplot(data=word_count_gender_parenthood, aes(x=reorder(word, -n), y=n, group=gender, fill=gender)) +
+  geom_bar(position = "stack", stat = "identity")  + 
+  scale_y_continuous(labels= c(2000, 1000, 0, 1000, 2000), breaks =c(-2000, -1000, 0, 1000, 2000))+
+  coord_flip() + xlab("word") + ylab("frequency")
+ 
+```
+
+
+### step 4 - Topic Model: what are the happy things for parents ?
+
+Here we will dig deeper the topic of parents happy moments. Here will use Latent Dirichlet allocation (LDA) method to fit a topic model using Gibbs sampling option.
+
+#### Topic Model for Mothers
+
+```{r mather topic model}
+dt_mather <- hm_data %>% 
+  filter(parenthood == "y" & gender == "f")
+
+DocTerm_mather <- VCorpus(VectorSource(dt_mather$text)) %>% DocumentTermMatrix()
+DocTerm_mather <- DocTerm_mather[row_sums(DocTerm_mather) > 0, ]
+
+#Set parameters for Gibbs sampling
+burnin <- 800
+iter <- 400
+thin <- 100
+seed <-list(1,2,1000,2000, 500)
+nstart <- 5
+best <- TRUE
+#Number of topics
+k <- 10
+
+lda_mather <- LDA(DocTerm_mather, method = "Gibbs", k=k,
+                  control = list(nstart=nstart, thin=thin, 
+                                 burnin=burnin, iter=iter, 
+                                 best=best, seed=seed))
+#write out results
+topics_mather <- as.matrix(topics(lda_mather))
+table(c(1:k, topics_mather))
+
+#top 10 terms in each topic
+terms_mather <- as.matrix(terms(lda_mather, 10))
+terms_mather
+
+#probabilities associated with each topic assignment
+topics_name <- c("Vacation", "Family", "Game", "People", "Work", "School", 
+                 "Social", "Celebration", "Shopping", "Pets")
+topics_df_mather <- tidy(lda_mather, matrix="beta")
+topics_df_mather$topicname <- topics_name[topics_df_mather$topic]
+topterms_mather <- topics_df_mather %>% 
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+topterms_mather %>% 
+  mutate(term = reorder(term, beta)) %>%
+  ggplot(aes(term, beta, fill=factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap( ~ topicname, scales="free") +
+  coord_flip()
+  
+  
+```
+
+#### Topic Model for Fathers
+
+```{r father topic model}
+dt_father <- hm_data %>% 
+  filter(parenthood == "y" & gender == "m")
+
+DocTerm_father <- VCorpus(VectorSource(dt_father$text)) %>% DocumentTermMatrix()
+DocTerm_father <- DocTerm_father[row_sums(DocTerm_father) > 0, ]
+
+lda_father <- LDA(DocTerm_father, method = "Gibbs", k=k,
+                  control = list(nstart=nstart, thin=thin, 
+                                 burnin=burnin, iter=iter, 
+                                 best=best, seed=seed))
+
+#write out results
+topics_father <- as.matrix(topics(lda_father))
+table(c(1:k, topics_father))
+
+#top 10 terms in each topic
+terms_father <- as.matrix(terms(lda_father, 10))
+terms_father
+
+#probabilities associated with each topic assignment
+topic_name <- c("Celebration", "Work", "School", "Social", "Shopping", "Entertainment", 
+                "Family", "People", " Vacation", "Game")
+topics_df_father <- tidy(lda_father, matrix="beta")
+topics_df_father$topicname <- topic_name[topics_df_father$topic]
+topterms_father <- topics_df_father %>% 
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+topterms_father %>% 
+  mutate(term = reorder(term, beta)) %>%
+  ggplot(aes(term, beta, fill=factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap( ~ topicname, scales="free") +
+  coord_flip()
+  
+```
+
+
+### Step5 - Conclusion
+
+As we can see above, female and male's happy moments would like to change after being parents. Mathers would experience more times affection type happy than females who are not parental. Fathers are getting happy moments more times in achievements than males who are not parental. To be noticed, this result may not only result from parenthood role, but also age stage, which  is not study in this blog.
+
+Based on the topic models for mathers and fathers, we can also find that fathers get happy moments in vacation, celebration and family more likely, mathers more about family, celebration,  people, school and game.
